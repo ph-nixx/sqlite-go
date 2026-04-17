@@ -48,11 +48,6 @@ func main() {
 			log.Printf("result: sqlite file header is %d bytes, expected: always 100 bytes", n)
 		}
 
-		_, err = databaseFile.Read(header)
-		if err != nil {
-			log.Fatal(err)
-		}
-
 		var pageSize uint16
 		if err := binary.Read(bytes.NewReader(header[16:18]), binary.BigEndian, &pageSize); err != nil {
 			fmt.Println("Failed to read integer:", err)
