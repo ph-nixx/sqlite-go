@@ -27,7 +27,77 @@ const (
 )
 
 type RecordHeader struct {
-	tblName string
+	cellOffset          int
+	headerSize          int
+	headerOffset        int
+	typeVarintOffset    int
+	typeSize            int
+	typeOffset          int
+	nameVarintOffset    int
+	nameSize            int
+	nameOffset          int
+	tblNameVarintOffset int
+	tblName             []byte
+	tblNameSize         int
+	tblNameOffset       int
+}
+
+func (r *RecordHeader) setHeaderMeta(dbfile *os.File, cellOffset int) error {
+	r.cellOffset = cellOffset
+	_, n1, err := decodeVarintAt(dbfile, cellOffset)
+	if err != nil {
+		return fmt.Errorf("failed to decode recordSize varint from %s : %w", dbfile.Name(), err)
+	}
+	_, n2, err := decodeVarintAt(dbfile, cellOffset+n1)
+	if err != nil {
+		return fmt.Errorf("failed to decode rowid varint from %s : %w", dbfile.Name(), err)
+	}
+
+	r.headerOffset = cellOffset + n1 + n2
+	headerSize, n3, err := decodeVarintAt(dbfile, r.headerOffset)
+	if err != nil {
+		return fmt.Errorf("failed to decode record header size varint from %s : %w", dbfile.Name(), err)
+	}
+	r.headerSize = int(headerSize)
+	r.typeVarintOffset = r.headerOffset + n3
+	return nil
+}
+
+func (r *RecordHeader) setTypeMeta(dbfile *os.File, headerOffset, headerSize int) error {
+	size, n, err := parseSerialTypeVarintAt(dbfile, r.typeVarintOffset)
+	if err != nil {
+		return fmt.Errorf("failed to parse record type field from %s : %w", dbfile.Name(), err)
+	}
+	r.typeOffset = headerOffset + headerSize
+	r.typeSize = size
+	r.nameVarintOffset = r.typeVarintOffset + n
+	return nil
+}
+
+func (r *RecordHeader) setNameMeta(dbfile *os.File, typeOffset, typeSize int) error {
+	size, n, err := parseSerialTypeVarintAt(dbfile, r.nameVarintOffset)
+	if err != nil {
+		return fmt.Errorf("failed to parse record name field from %s : %w", dbfile.Name(), err)
+	}
+	r.nameOffset = typeOffset + typeSize
+	r.nameSize = size
+	r.tblNameVarintOffset = r.nameVarintOffset + n
+	return nil
+}
+
+func (r *RecordHeader) setTblName(dbfile *os.File, nameOffset, nameSize int) error {
+	size, _, err := parseSerialTypeVarintAt(dbfile, r.tblNameVarintOffset)
+	if err != nil {
+		return err
+	}
+	r.tblNameOffset = nameOffset + nameSize
+	r.tblNameSize = size
+	buf := make([]byte, size)
+	if _, err := dbfile.ReadAt(buf, int64(r.tblNameOffset)); err != nil {
+		return err
+	}
+	r.tblName = buf
+	return nil
 }
 
 func getFileField(dbfile *os.File, field fileField) (uint16, error) {
@@ -59,7 +129,7 @@ func getTableNames(dbfile *os.File) ([]string, error) {
 	}
 	result := make([]string, len(recordHeaders))
 	for i, record := range recordHeaders {
-		result[i] = record.tblName
+		result[i] = string(record.tblName)
 	}
 	return result, nil
 }
@@ -75,8 +145,7 @@ func getCellOffsets(dbfile *os.File) ([]int, error) {
 	for i := range arrayLen {
 		start := i * cellOffsetBytes
 		end := start + cellOffsetBytes
-		number := binary.BigEndian.Uint16(buf[start:end])
-		result[i] = int(number)
+		result[i] = int(binary.BigEndian.Uint16(buf[start:end]))
 	}
 	return result, nil
 }
@@ -86,72 +155,36 @@ func getRecordHeaders(dbfile *os.File) ([]RecordHeader, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := make([]RecordHeader, len(offsets))
+	records := make([]RecordHeader, len(offsets))
 	for i, cellOffset := range offsets {
-		readOffset, err := skipVarintAt(dbfile, cellOffset)
-		if err != nil {
+		if err := records[i].setHeaderMeta(dbfile, cellOffset); err != nil {
 			return nil, err
 		}
-		headerSizeOffset, err := skipVarintAt(dbfile, readOffset)
-		if err != nil {
+		if err := records[i].setTypeMeta(dbfile, records[i].headerOffset, records[i].headerSize); err != nil {
 			return nil, err
 		}
-		readOffset, headerSize, err := parseVarint(dbfile, headerSizeOffset)
-		if err != nil {
+		if err := records[i].setNameMeta(dbfile, records[i].typeOffset, records[i].typeSize); err != nil {
 			return nil, err
 		}
-
-		seekOffset := headerSizeOffset + headerSize
-		readOffset, typeSize, err := parseVarint(dbfile, readOffset)
-		if err != nil {
+		if err := records[i].setTblName(dbfile, records[i].nameOffset, records[i].nameSize); err != nil {
 			return nil, err
 		}
-		seekOffset += typeSize
-		readOffset, nameSize, err := parseVarint(dbfile, readOffset)
-		if err != nil {
-			return nil, err
-		}
-		seekOffset += nameSize
-		readOffset, tblNameSize, err := parseVarint(dbfile, readOffset)
-		if err != nil {
-			return nil, err
-		}
-
-		buf := make([]byte, tblNameSize)
-		if _, err := dbfile.ReadAt(buf, int64(seekOffset)); err != nil {
-			return nil, err
-		}
-		result[i] = RecordHeader{tblName: string(buf)}
 	}
-	return result, nil
+	return records, nil
 }
 
-func skipVarintAt(dbfile *os.File, offset int) (int, error) {
-	buf := make([]byte, varIntMax)
-	if _, err := dbfile.ReadAt(buf, int64(offset)); err != nil {
-		return 0, err
-	}
-	for i := range varIntMax - 1 {
-		b := buf[i]
-		if b>>7 == 0 {
-			return offset + i + 1, nil
-		}
-	}
-	return offset + varIntMax, nil
-}
-
-func parseVarint(dbfile *os.File, readOffset int) (int, int, error) {
-	value, n, err := decodeVarintAt(dbfile, readOffset)
+func parseSerialTypeVarintAt(dbfile *os.File, offset int) (int, int, error) {
+	value, n, err := decodeVarintAt(dbfile, offset)
 	if err != nil {
 		return 0, 0, err
 	}
 	if value >= 13 && value%2 != 0 {
-		return readOffset + n, decodeTextLength(value), nil
+		return decodeTextLength(value), n, nil
 	}
 	if value >= 12 && value%2 == 0 {
-		return readOffset + n, decodeBLOBLength(value), nil
+		return decodeBLOBLength(value), n, nil
 	}
-	return readOffset + n, int(value), nil
+	return int(value), n, nil
 }
 
 func decodeTextLength(value uint64) int {
