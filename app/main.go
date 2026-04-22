@@ -14,18 +14,23 @@ import (
 type fileField string
 
 const (
-	recordSchemaSize             = 3
-	pageSize           fileField = "pageSize"
-	cellCount          fileField = "cellCount"
-	mainHeaderOffset             = 0
-	schemaHeaderOffset           = 100
-	cellArrayOffset              = 108
-	pageSizeOffset               = 16
-	cellCountOffset              = 3
-	pageSizeBytes                = 2
-	cellCountBytes               = 2
-	cellOffsetBytes              = 2
-	varIntMax                    = 9
+	databaseFilePageSizeOffset       = 16
+	sqliteSchemaHeaderOffset         = 100
+	cellPtrArraySizeOffsetFromHeader = 3
+	cellPtrArrayOffsetFromLeafHeader = 8
+	cellPtrVarint                    = 2
+	pageSizeVarint                   = 2
+	pageCellCountVarint              = 2
+	varintMax                        = 9
+	sqliteRecordSchemaSize           = 4
+	sqliteSchemaPage                 = 1
+)
+
+const (
+	tableType = iota
+	name
+	tblName
+	rootpage
 )
 
 type RecordHeader struct {
@@ -33,20 +38,15 @@ type RecordHeader struct {
 	headerSize   int
 	headerOffset int
 	schemaOffset int
-	schema       []RecordTextField
+	schema       []RecordField
 }
 
-const (
-	fileType = iota
-	fieldName
-	fieldTblName
-)
-
-type RecordTextField struct {
+type RecordField struct {
 	serialTypeOffset int
 	offset           int
 	length           int
 	text             []byte
+	varint           int
 }
 
 func (r *RecordHeader) setHeaderMeta(dbfile io.ReaderAt, cellOffset int) error {
@@ -69,84 +69,121 @@ func (r *RecordHeader) setHeaderMeta(dbfile io.ReaderAt, cellOffset int) error {
 	return nil
 }
 
-func (r *RecordHeader) setSchema(dbfile io.ReaderAt) error {
+func (r *RecordHeader) setSqliteSchemaRecordHeader(dbfile io.ReaderAt) error {
 	serialTypeOffset := r.schemaOffset
 	offset := r.headerOffset + r.headerSize
-	schema := make([]RecordTextField, recordSchemaSize)
-	for i := range recordSchemaSize {
+	schema := make([]RecordField, sqliteRecordSchemaSize)
+	for i := range sqliteRecordSchemaSize {
 		schema[i].serialTypeOffset = serialTypeOffset
 		schema[i].offset = offset
-		size, n, err := parseSerialTypeVarintAt(dbfile, serialTypeOffset)
+		value, n, err := parseSerialTypeVarintAt(dbfile, serialTypeOffset) // value is to vague and this interface is ambiguouse
 		if err != nil {
 			return fmt.Errorf("failed to parse record text field: %w", err)
 		}
-		if i == fieldTblName {
-			buf := make([]byte, size)
-			if _, err := dbfile.ReadAt(buf, int64(schema[fieldTblName].offset)); err != nil {
+		switch i {
+		case tblName:
+			buf := make([]byte, value)
+			if _, err := dbfile.ReadAt(buf, int64(schema[tblName].offset)); err != nil {
 				return err
 			}
+			schema[i].length = value
 			schema[i].text = buf
+		case rootpage:
+			buf := make([]byte, 1) // brittle
+			if _, err := dbfile.ReadAt(buf, int64(schema[rootpage].offset)); err != nil {
+				return err
+			}
+			schema[i].varint = int(buf[0])
+			value = n
 		}
-		schema[i].length = size
+		offset += value
 		serialTypeOffset += n
-		offset += size
 	}
 	r.schema = schema
 	return nil
 }
 
-func getFileField(dbfile io.ReaderAt, field fileField) (uint16, error) {
-	readSize := 0
-	offset := 0
-	switch field {
-	case pageSize:
-		readSize = pageSizeBytes
-		offset = mainHeaderOffset + pageSizeOffset
-	case cellCount:
-		readSize = cellCountBytes
-		offset = schemaHeaderOffset + cellCountOffset
-	}
-
-	buf := make([]byte, readSize)
-	_, err := dbfile.ReadAt(buf, int64(offset))
+func getTableRootpage(dbfile io.ReaderAt, name string) (int, error) {
+	offsets, err := getPageCellPtrs(dbfile, sqliteSchemaPage)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read sqlite file header: %w", err)
+		return 0, err
 	}
-
-	number := binary.BigEndian.Uint16(buf)
-	return number, nil
+	for _, cellOffset := range offsets {
+		record := RecordHeader{}
+		if err := record.setHeaderMeta(dbfile, cellOffset); err != nil {
+			return 0, err
+		}
+		if err := record.setSqliteSchemaRecordHeader(dbfile); err != nil {
+			return 0, err
+		}
+		if string(record.schema[tblName].text) == name {
+			return record.schema[rootpage].varint, nil
+		}
+	}
+	return 0, fmt.Errorf("unknown table: %s", name)
 }
 
 func getTableNames(dbfile io.ReaderAt) ([]string, error) {
-	recordHeaders, err := getRecordHeaders(dbfile)
+	recordHeaders, err := getSqliteSchemaRecordHeaders(dbfile)
 	if err != nil {
 		return nil, err
 	}
 	result := make([]string, len(recordHeaders))
 	for i, record := range recordHeaders {
-		result[i] = string(record.schema[fieldTblName].text)
+		result[i] = string(record.schema[tblName].text)
 	}
 	return result, nil
 }
 
-func getCellOffsets(dbfile io.ReaderAt) ([]int, error) {
-	arrayLen, err := getFileField(dbfile, cellCount)
-	buf := make([]byte, arrayLen*cellOffsetBytes)
-	_, err = dbfile.ReadAt(buf, cellArrayOffset)
+func getDBPageSize(dbfile io.ReaderAt) (int, error) {
+	buf := make([]byte, pageSizeVarint)
+	if _, err := dbfile.ReadAt(buf, databaseFilePageSizeOffset); err != nil {
+		return 0, err
+	}
+	return int(binary.BigEndian.Uint16(buf)), nil
+}
+
+func getPageCellPtrArray(dbfile io.ReaderAt, pageNumber int) (int, int, error) {
+	pageSize, err := getDBPageSize(dbfile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read cell offset array: %w", err)
+		return 0, 0, err
 	}
-	result := make([]int, arrayLen)
-	for i := range arrayLen {
-		start := i * cellOffsetBytes
-		end := start + cellOffsetBytes
-		result[i] = int(binary.BigEndian.Uint16(buf[start:end]))
+	buf := make([]byte, pageCellCountVarint)
+	pageOffset := (pageNumber - 1) * pageSize
+	if pageNumber == sqliteSchemaPage {
+		pageOffset = sqliteSchemaHeaderOffset
 	}
-	return result, nil
+	cellPtrArraySizeOffset := pageOffset + cellPtrArraySizeOffsetFromHeader
+	if _, err := dbfile.ReadAt(buf, int64(cellPtrArraySizeOffset)); err != nil {
+		return 0, 0, fmt.Errorf("failed to read b-tree page header: %w", err)
+	}
+
+	// assuming never interior b-tree page
+	cellPtrArrayOffset := pageOffset + cellPtrArrayOffsetFromLeafHeader
+	return cellPtrArrayOffset, int(binary.BigEndian.Uint16(buf)), nil
 }
 
-func getRecordHeaders(dbfile io.ReaderAt) ([]RecordHeader, error) {
-	offsets, err := getCellOffsets(dbfile)
+func getPageCellPtrs(dbfile io.ReaderAt, pageNumber int) ([]int, error) {
+	cellPtrArrayOffset, size, err := getPageCellPtrArray(dbfile, pageNumber)
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]byte, size*cellPtrVarint)
+	_, err = dbfile.ReadAt(buf, int64(cellPtrArrayOffset))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read cell ptr array: %w", err)
+	}
+	cellPtrs := make([]int, size)
+	for i := range size {
+		start := i * cellPtrVarint
+		end := (i + 1) * cellPtrVarint
+		cellPtrs[i] = int(binary.BigEndian.Uint16(buf[start:end]))
+	}
+	return cellPtrs, nil
+}
+
+func getSqliteSchemaRecordHeaders(dbfile io.ReaderAt) ([]RecordHeader, error) {
+	offsets, err := getPageCellPtrs(dbfile, sqliteSchemaPage)
 	if err != nil {
 		return nil, err
 	}
@@ -155,7 +192,7 @@ func getRecordHeaders(dbfile io.ReaderAt) ([]RecordHeader, error) {
 		if err := records[i].setHeaderMeta(dbfile, cellOffset); err != nil {
 			return nil, err
 		}
-		if err := records[i].setSchema(dbfile); err != nil {
+		if err := records[i].setSqliteSchemaRecordHeader(dbfile); err != nil {
 			return nil, err
 		}
 	}
@@ -185,39 +222,35 @@ func decodeBLOBLength(value uint64) int {
 }
 
 func decodeVarintAt(dbfile io.ReaderAt, offset int) (uint64, int, error) {
-	buf := make([]byte, varIntMax)
+	buf := make([]byte, varintMax)
 	if _, err := dbfile.ReadAt(buf, int64(offset)); err != nil {
 		return 0, 0, err
 	}
 	var number uint64
-	for i := range varIntMax - 1 {
+	for i := range varintMax - 1 {
 		b := buf[i]
 		number = (number << 7) | uint64(b&0x7F)
 		if b>>7 == 0 {
 			return number, i + 1, nil
 		}
 	}
-	number = (number << 8) | uint64(buf[varIntMax-1])
-	return number, varIntMax, nil
+	number = (number << 8) | uint64(buf[varintMax-1])
+	return number, varintMax, nil
 }
 
-// Usage: your_program.sh sample.db .dbinfo
-func main() {
-	databaseFilePath := os.Args[1]
-	command := os.Args[2]
-
+func dotCommand(databaseFilePath, command string) {
 	switch command {
 	case ".dbinfo":
 		fd, err := os.Open(databaseFilePath)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln(err)
 		}
 		defer fd.Close()
-		pageSize, err := getFileField(fd, pageSize)
+		pageSize, err := getDBPageSize(fd)
 		if err != nil {
 			log.Fatalln(err)
 		}
-		cellCount, err := getFileField(fd, cellCount)
+		_, cellCount, err := getPageCellPtrArray(fd, sqliteSchemaPage)
 		if err != nil {
 			log.Fatalln(err)
 		}
@@ -227,7 +260,7 @@ func main() {
 	case ".tables":
 		fd, err := os.Open(databaseFilePath)
 		if err != nil {
-			log.Fatal(err)
+			log.Fatalln(err)
 		}
 		defer fd.Close()
 		names, err := getTableNames(fd)
@@ -237,7 +270,46 @@ func main() {
 
 		fmt.Println(strings.Join(names, " "))
 	default:
-		log.Fatalln("Unknown command", command)
-		os.Exit(1)
+		log.Fatalln("unknown command", command)
+	}
+}
+
+// Usage: your_program.sh sample.db .dbinfo
+func main() {
+	databaseFilePath := os.Args[1]
+	command := os.Args[2]
+
+	if len(os.Args) == 3 && strings.HasPrefix(command, ".") {
+		dotCommand(databaseFilePath, command)
+		return
+	}
+
+	sql := strings.Split(strings.TrimSpace(command), " ")
+	if len(sql) < 4 {
+		log.Fatalf("invalid sql syntax: %s\n", strings.Join(sql, " "))
+	}
+
+	switch strings.ToUpper(sql[0]) {
+	case "SELECT":
+		fd, err := os.Open(databaseFilePath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		defer fd.Close()
+		if strings.ToUpper(sql[1]) == "COUNT(*)" {
+			page, err := getTableRootpage(fd, sql[3])
+			if err != nil {
+				log.Fatalln(err)
+			}
+			_, cellCount, err := getPageCellPtrArray(fd, page)
+			if err != nil {
+				log.Fatalln(err)
+			}
+			fmt.Println(cellCount)
+		} else {
+			log.Fatalf("invalid SELECT statement: %s\n", strings.Join(sql[:3], " "))
+		}
+	default:
+		log.Fatalf("unknown DML statement: %s\n", sql[0])
 	}
 }
