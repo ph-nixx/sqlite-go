@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 	// Available if you need it!
-	// "github.com/xwb1989/sqlparser"
+	"github.com/xwb1989/sqlparser"
 )
 
 type fileField string
@@ -26,27 +26,42 @@ const (
 	sqliteSchemaPage                 = 1
 )
 
-const (
-	tableType = iota
-	name
-	tblName
-	rootpage
-)
+var sqliteSchema = []string{"tableType", "name", "tblName", "rootpage"}
 
 type RecordHeader struct {
 	cellOffset   int
 	headerSize   int
 	headerOffset int
 	schemaOffset int
-	schema       []RecordField
+	schema       map[string]RecordField
 }
 
 type RecordField struct {
-	serialTypeOffset int
-	offset           int
-	length           int
-	text             []byte
-	varint           int
+	offset int
+	length int
+}
+
+func (r RecordField) parseString(dbfile io.ReaderAt) (string, error) {
+	buf := make([]byte, r.length)
+	if _, err := dbfile.ReadAt(buf, int64(r.offset)); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
+
+func (r RecordField) parseInt(dbfile io.ReaderAt) (int64, error) {
+	if r.length > 8 {
+		return 0, fmt.Errorf("expected RecordField integer value to be at most 8 bytes: %#v", r)
+	}
+	buf := make([]byte, r.length)
+	if _, err := dbfile.ReadAt(buf, int64(r.offset)); err != nil {
+		return 0, err
+	}
+	var num int64
+	for _, b := range buf {
+		num = num<<8 | int64(b)
+	}
+	return num, nil
 }
 
 func (r *RecordHeader) setHeaderMeta(dbfile io.ReaderAt, cellOffset int) error {
@@ -69,34 +84,21 @@ func (r *RecordHeader) setHeaderMeta(dbfile io.ReaderAt, cellOffset int) error {
 	return nil
 }
 
-func (r *RecordHeader) setSqliteSchemaRecordHeader(dbfile io.ReaderAt) error {
+func (r *RecordHeader) setRecordHeaderFields(dbfile io.ReaderAt, cols []string) error {
 	serialTypeOffset := r.schemaOffset
 	offset := r.headerOffset + r.headerSize
-	schema := make([]RecordField, sqliteRecordSchemaSize)
-	for i := range sqliteRecordSchemaSize {
-		schema[i].serialTypeOffset = serialTypeOffset
-		schema[i].offset = offset
-		value, n, err := parseSerialTypeVarintAt(dbfile, serialTypeOffset) // value is to vague and this interface is ambiguouse
+	schema := map[string]RecordField{}
+	for _, name := range cols {
+		field := RecordField{}
+		field.offset = offset
+		serialType, n, err := decodeVarintAt(dbfile, serialTypeOffset) // value is to vague and this interface is ambiguouse
 		if err != nil {
 			return fmt.Errorf("failed to parse record text field: %w", err)
 		}
-		switch i {
-		case tblName:
-			buf := make([]byte, value)
-			if _, err := dbfile.ReadAt(buf, int64(schema[tblName].offset)); err != nil {
-				return err
-			}
-			schema[i].length = value
-			schema[i].text = buf
-		case rootpage:
-			buf := make([]byte, 1) // brittle
-			if _, err := dbfile.ReadAt(buf, int64(schema[rootpage].offset)); err != nil {
-				return err
-			}
-			schema[i].varint = int(buf[0])
-			value = n
-		}
-		offset += value
+		payloadLen := decodeSerialTypePayloadLen(int(serialType))
+		field.length = payloadLen
+		schema[name] = field
+		offset += payloadLen
 		serialTypeOffset += n
 	}
 	r.schema = schema
@@ -113,12 +115,19 @@ func getTableRootpage(dbfile io.ReaderAt, name string) (int, error) {
 		if err := record.setHeaderMeta(dbfile, cellOffset); err != nil {
 			return 0, err
 		}
-		if err := record.setSqliteSchemaRecordHeader(dbfile); err != nil {
+		if err := record.setRecordHeaderFields(dbfile, sqliteSchema); err != nil {
 			return 0, err
 		}
-		if string(record.schema[tblName].text) == name {
-			return record.schema[rootpage].varint, nil
+		if tblName, err := record.schema[sqliteSchema[2]].parseString(dbfile); err != nil {
+			return 0, err
+		} else if tblName != name {
+			continue
 		}
+		rootpage, err := record.schema[sqliteSchema[3]].parseInt(dbfile)
+		if err != nil {
+			return 0, err
+		}
+		return int(rootpage), nil
 	}
 	return 0, fmt.Errorf("unknown table: %s", name)
 }
@@ -130,7 +139,11 @@ func getTableNames(dbfile io.ReaderAt) ([]string, error) {
 	}
 	result := make([]string, len(recordHeaders))
 	for i, record := range recordHeaders {
-		result[i] = string(record.schema[tblName].text)
+		tblName, err := record.schema[sqliteSchema[2]].parseString(dbfile)
+		if err != nil {
+			return nil, err
+		}
+		result[i] = tblName
 	}
 	return result, nil
 }
@@ -192,32 +205,37 @@ func getSqliteSchemaRecordHeaders(dbfile io.ReaderAt) ([]RecordHeader, error) {
 		if err := records[i].setHeaderMeta(dbfile, cellOffset); err != nil {
 			return nil, err
 		}
-		if err := records[i].setSqliteSchemaRecordHeader(dbfile); err != nil {
+		if err := records[i].setRecordHeaderFields(dbfile, sqliteSchema); err != nil {
 			return nil, err
 		}
 	}
 	return records, nil
 }
 
-func parseSerialTypeVarintAt(dbfile io.ReaderAt, offset int) (int, int, error) {
-	value, n, err := decodeVarintAt(dbfile, offset)
-	if err != nil {
-		return 0, 0, err
+func decodeSerialTypePayloadLen(serialType int) int {
+	if serialType >= 13 && serialType%2 != 0 {
+		return decodeTextLength(serialType)
 	}
-	if value >= 13 && value%2 != 0 {
-		return decodeTextLength(value), n, nil
+	if serialType >= 12 && serialType%2 == 0 {
+		return decodeBLOBLength(serialType)
 	}
-	if value >= 12 && value%2 == 0 {
-		return decodeBLOBLength(value), n, nil
+	switch serialType {
+	case 5:
+		return 6
+	case 6 | 7:
+		return 8
+	case 8 | 9:
+		return 0
+	default:
+		return serialType
 	}
-	return int(value), n, nil
 }
 
-func decodeTextLength(value uint64) int {
+func decodeTextLength(value int) int {
 	return int((value - 13) / 2)
 }
 
-func decodeBLOBLength(value uint64) int {
+func decodeBLOBLength(value int) int {
 	return int((value - 12) / 2)
 }
 
@@ -238,14 +256,9 @@ func decodeVarintAt(dbfile io.ReaderAt, offset int) (uint64, int, error) {
 	return number, varintMax, nil
 }
 
-func dotCommand(databaseFilePath, command string) {
+func dotCommand(fd *os.File, command string) {
 	switch command {
 	case ".dbinfo":
-		fd, err := os.Open(databaseFilePath)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		defer fd.Close()
 		pageSize, err := getDBPageSize(fd)
 		if err != nil {
 			log.Fatalln(err)
@@ -258,11 +271,6 @@ func dotCommand(databaseFilePath, command string) {
 		fmt.Printf("database page size: %v\n", pageSize)
 		fmt.Printf("number of tables: %v\n", cellCount)
 	case ".tables":
-		fd, err := os.Open(databaseFilePath)
-		if err != nil {
-			log.Fatalln(err)
-		}
-		defer fd.Close()
 		names, err := getTableNames(fd)
 		if err != nil {
 			log.Fatalln(err)
@@ -274,42 +282,59 @@ func dotCommand(databaseFilePath, command string) {
 	}
 }
 
+func isCount(exprs sqlparser.SelectExprs) bool {
+	if len(exprs) != 1 {
+		return false
+	}
+	fn, ok := exprs[0].(*sqlparser.AliasedExpr).Expr.(*sqlparser.FuncExpr)
+	if !ok {
+		return false
+	}
+	if !fn.IsAggregate() {
+		return false
+	}
+	return fn.Name.EqualString("count")
+}
+
 // Usage: your_program.sh sample.db .dbinfo
 func main() {
 	databaseFilePath := os.Args[1]
 	command := os.Args[2]
 
+	fd, err := os.Open(databaseFilePath)
+	if err != nil {
+		log.Fatalln(err)
+	}
+	defer fd.Close()
+
 	if len(os.Args) == 3 && strings.HasPrefix(command, ".") {
-		dotCommand(databaseFilePath, command)
+		dotCommand(fd, command)
 		return
 	}
 
-	sql := strings.Split(strings.TrimSpace(command), " ")
-	if len(sql) < 4 {
-		log.Fatalf("invalid sql syntax: %s\n", strings.Join(sql, " "))
+	stmt, err := sqlparser.Parse(command)
+	if err != nil {
+		log.Fatalln(err)
 	}
 
-	switch strings.ToUpper(sql[0]) {
-	case "SELECT":
-		fd, err := os.Open(databaseFilePath)
-		if err != nil {
-			log.Fatal(err)
-		}
-		defer fd.Close()
-		if strings.ToUpper(sql[1]) == "COUNT(*)" {
-			page, err := getTableRootpage(fd, sql[3])
+	switch stmt := stmt.(type) {
+	case *sqlparser.Select:
+		if isCount(stmt.SelectExprs) {
+			firstTable, ok := stmt.From[0].(*sqlparser.AliasedTableExpr)
+			if !ok {
+				log.Fatalln("expected a single table")
+			}
+			tbl, ok := firstTable.Expr.(sqlparser.TableName)
+			if !ok {
+				log.Fatalln("expect the value to be a table", firstTable)
+			}
+			rootpage, err := getTableRootpage(fd, tbl.Name.String())
 			if err != nil {
 				log.Fatalln(err)
 			}
-			_, cellCount, err := getPageCellPtrArray(fd, page)
-			if err != nil {
-				log.Fatalln(err)
-			}
+			_, cellCount, err := getPageCellPtrArray(fd, rootpage)
 			fmt.Println(cellCount)
-		} else {
-			log.Fatalf("invalid SELECT statement: %s\n", strings.Join(sql[:3], " "))
+		} else if simpleSingleCol(stmt.SelectExprs) {
 		}
-	default:
-		log.Fatalf("unknown DML statement: %s\n", sql[0])
 	}
 }
