@@ -114,7 +114,7 @@ func (r *RecordHeader) setRecordHeaderFields(dbfile io.ReaderAt, cols []string) 
 	return nil
 }
 
-func getSingleCol(dbfile io.ReaderAt, tblName, col string) ([]string, error) {
+func getRowFields(dbfile io.ReaderAt, tblName string, cols []string) ([][]string, error) {
 	rootpage, err := getTableRootpage(dbfile, tblName)
 	if err != nil {
 		return nil, err
@@ -123,24 +123,32 @@ func getSingleCol(dbfile io.ReaderAt, tblName, col string) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	cols, err := getTableColNames(dbfile, tblName)
+	schemaCols, err := getTableColNames(dbfile, tblName)
 	if err != nil {
 		return nil, err
 	}
-	fieldValues := make([]string, len(offsets))
+	fieldValues := make([][]string, len(offsets))
 	for i, offset := range offsets {
 		record := RecordHeader{}
 		if err := record.setHeaderMeta(dbfile, offset); err != nil {
 			return nil, err
 		}
-		if err := record.setRecordHeaderFields(dbfile, cols); err != nil {
+		if err := record.setRecordHeaderFields(dbfile, schemaCols); err != nil {
 			return nil, err
 		}
-		fieldValue, err := record.schema[col].parseString(dbfile)
-		if err != nil {
-			return nil, err
+		fields := make([]string, len(cols))
+		for j, col := range cols {
+			field, ok := record.schema[col]
+			if !ok {
+				return nil, fmt.Errorf("column '%s' does not exist in table '%s'", col, tblName)
+			}
+			fieldValue, err := field.parseString(dbfile)
+			if err != nil {
+				return nil, err
+			}
+			fields[j] = fieldValue
 		}
-		fieldValues[i] = fieldValue
+		fieldValues[i] = fields
 	}
 	return fieldValues, nil
 }
@@ -397,8 +405,8 @@ func isCount(exprs sqlparser.SelectExprs) bool {
 	return fn.Name.EqualString("count")
 }
 
-func isSingleColAndTable(selectExprs sqlparser.SelectExprs, tableExprs sqlparser.TableExprs) bool {
-	return len(selectExprs) == 1 && len(tableExprs) == 1
+func isSingleTable(tableExprs sqlparser.TableExprs) bool {
+	return len(tableExprs) == 1
 }
 
 // Usage: your_program.sh sample.db .dbinfo
@@ -440,15 +448,17 @@ func main() {
 				log.Fatalln(err)
 			}
 			fmt.Println(cellCount)
-		} else if isSingleColAndTable(stmt.SelectExprs, stmt.From) {
+		} else if isSingleTable(stmt.From) {
 			firstTable := stmt.From[0].(*sqlparser.AliasedTableExpr)
 			tbl := firstTable.Expr.(sqlparser.TableName)
-			col := sqlparser.String(stmt.SelectExprs)
-			rowValues, err := getSingleCol(fd, tbl.Name.String(), col)
+			cols := strings.Split(sqlparser.String(stmt.SelectExprs), ", ")
+			rows, err := getRowFields(fd, tbl.Name.String(), cols)
 			if err != nil {
 				log.Fatalln(err)
 			}
-			fmt.Println(strings.Join(rowValues, "\n"))
+			for _, row := range rows {
+				fmt.Println(strings.Join(row, "|"))
+			}
 		}
 	}
 }
