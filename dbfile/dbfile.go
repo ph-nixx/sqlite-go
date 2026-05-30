@@ -9,6 +9,7 @@ import (
 )
 
 const (
+	sqliteSchemaPageOffset   = 0
 	sqliteSchemaHeaderOffset = 100
 	sqliteSchemaTblName      = "sqlite_schema"
 )
@@ -34,7 +35,7 @@ func New(fd io.ReaderAt) (*DBFile, error) {
 	sqliteSchema := Table{
 		fd:         fd,
 		tblName:    sqliteSchemaTblName,
-		pageOffset: sqliteSchemaHeaderOffset,
+		pageOffset: sqliteSchemaPageOffset,
 	}
 	return &DBFile{fd: fd, SqliteSchema: sqliteSchema, PageSize: pageSize}, nil
 }

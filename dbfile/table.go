@@ -47,28 +47,37 @@ func (t *Table) GetRowFields(cols []string) ([][]string, error) {
 
 func (t *Table) GetCellPtrArray() (int, int, error) {
 	buf := make([]byte, pageCellCountVarint)
+
+	// ASSUMING always b-tree leaf page
+	cellPtrArrayOffset := t.pageOffset + cellPtrArrayOffsetFromLeafHeader
 	cellPtrArraySizeOffset := t.pageOffset + cellPtrArraySizeOffsetFromHeader
+	if t.pageOffset == sqliteSchemaPageOffset {
+		cellPtrArraySizeOffset += sqliteSchemaHeaderOffset
+		cellPtrArrayOffset += sqliteSchemaHeaderOffset
+	}
+
 	if _, err := t.fd.ReadAt(buf, int64(cellPtrArraySizeOffset)); err != nil {
 		return 0, 0, fmt.Errorf("failed to read BTree page header: %w", err)
 	}
 
-	// ASSUMING always BTree leaf page
-	return t.pageOffset + cellPtrArrayOffsetFromLeafHeader, int(binary.BigEndian.Uint16(buf)), nil
+	cellCount := int(binary.BigEndian.Uint16(buf))
+	return cellPtrArrayOffset, cellCount, nil
 }
 
 func (t *Table) getCellPtrs() ([]int, error) {
-	cellPtrArrayOffset, size, err := t.GetCellPtrArray()
+	cellPtrArrayOffset, cellCount, err := t.GetCellPtrArray()
 	if err != nil {
 		return nil, err
 	}
 
-	buf := make([]byte, size*cellPtrVarint)
+	buf := make([]byte, cellCount*cellPtrVarint)
 	_, err = t.fd.ReadAt(buf, int64(cellPtrArrayOffset))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read cell ptr array: %w", err)
 	}
-	cellPtrs := make([]int, size)
-	for i := range size {
+
+	cellPtrs := make([]int, cellCount)
+	for i := range cellCount {
 		start := i * cellPtrVarint
 		end := (i + 1) * cellPtrVarint
 		cellPtrs[i] = int(binary.BigEndian.Uint16(buf[start:end])) + t.pageOffset

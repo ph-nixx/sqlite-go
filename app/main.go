@@ -37,7 +37,11 @@ func isCount(exprs sqlparser.SelectExprs) bool {
 	if len(exprs) != 1 {
 		return false
 	}
-	fn, ok := exprs[0].(*sqlparser.AliasedExpr).Expr.(*sqlparser.FuncExpr)
+	aliased, ok := exprs[0].(*sqlparser.AliasedExpr)
+	if !ok {
+		return false
+	}
+	fn, ok := aliased.Expr.(*sqlparser.FuncExpr)
 	if !ok {
 		return false
 	}
