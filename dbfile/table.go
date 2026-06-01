@@ -23,7 +23,7 @@ type Cell struct {
 type Condition func(*Cell) (bool, error)
 
 func (c *Cell) UnwrapAsStrings(colOrder ...string) ([]string, error) {
-	if colOrder != nil && len(colOrder) != len(c.fields) {
+	if len(colOrder) != len(c.fields) {
 		return nil, fmt.Errorf(
 			"'%d' columns provided expected '%d'",
 			len(colOrder),
@@ -32,25 +32,12 @@ func (c *Cell) UnwrapAsStrings(colOrder ...string) ([]string, error) {
 	}
 
 	fieldValues := make([]string, len(c.fields))
-	if colOrder != nil {
-		for i, col := range colOrder {
-			str, err := c.UnwrapAsString(col)
-			if err != nil {
-				return nil, err
-			}
-			fieldValues[i] = str
-		}
-		return fieldValues, nil
-	}
-
-	i := 0
-	for _, v := range c.fields {
-		str, err := v.parseToString(c.fd)
+	for i, col := range colOrder {
+		str, err := c.UnwrapAsString(col)
 		if err != nil {
 			return nil, err
 		}
 		fieldValues[i] = str
-		i += 1
 	}
 	return fieldValues, nil
 }
@@ -100,7 +87,7 @@ func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 		unknownCols := []string{}
 		for i, found := range foundColsMask {
 			if !found {
-				unknownCols = append(unknownCols, cols[i])
+				unknownCols = append(unknownCols, colsClone[i])
 			}
 		}
 		return nil, fmt.Errorf("unknown elements [%s]", strings.Join(unknownCols, ", "))
