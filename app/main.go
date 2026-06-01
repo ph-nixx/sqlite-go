@@ -138,9 +138,6 @@ func main() {
 			if err != nil {
 				log.Fatalln(err)
 			}
-
-			fmt.Println(cols)
-
 			for _, cell := range cells {
 				row, err := cell.UnwrapAsStrings(cols...)
 				if err != nil {
