@@ -106,7 +106,16 @@ func main() {
 				log.Fatalln(err)
 			}
 
-			cols := strings.Split(sqlparser.String(stmt.SelectExprs), ", ")
+			cols := []string{}
+			for _, expr := range stmt.SelectExprs {
+				switch e := expr.(type) {
+				case *sqlparser.AliasedExpr:
+					if col, ok := e.Expr.(*sqlparser.ColName); ok {
+						cols = append(cols, col.Name.String())
+					}
+				}
+			}
+
 			var fn dbfile.Condition = nil
 			if stmt.Where != nil {
 				comp, _ := stmt.Where.Expr.(*sqlparser.ComparisonExpr)
@@ -130,8 +139,10 @@ func main() {
 				log.Fatalln(err)
 			}
 
+			fmt.Println(cols)
+
 			for _, cell := range cells {
-				row, err := cell.UnwrapAsStrings()
+				row, err := cell.UnwrapAsStrings(cols...)
 				if err != nil {
 					log.Fatalln(err)
 				}

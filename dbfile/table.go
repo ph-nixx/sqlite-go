@@ -71,19 +71,20 @@ func (c *Cell) UnwrapAsString(fieldName string) (string, error) {
 func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 	ColOrderMask := make([]bool, len(t.ColOrder))
 	foundColsMask := make([]bool, len(cols))
-	slices.Sort(cols)
+	colsClone := slices.Clone(cols)
+	slices.Sort(colsClone)
 	greatestIdx := 0
-	missing := len(cols)
+	missing := len(colsClone)
 	for i, p := range t.ColOrder {
 		if missing == 0 {
 			break
 		}
-		lo, up := 0, len(cols)-1
+		lo, up := 0, len(colsClone)-1
 		for lo <= up {
 			mid := (lo + up) / 2
-			if cols[mid] < p {
+			if colsClone[mid] < p {
 				lo = mid + 1
-			} else if cols[mid] > p {
+			} else if colsClone[mid] > p {
 				up = mid - 1
 			} else {
 				ColOrderMask[i] = true
