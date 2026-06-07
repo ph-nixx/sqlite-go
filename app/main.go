@@ -79,7 +79,6 @@ func main() {
 
 	stmt, err := sqlparser.Parse(command)
 	if err != nil {
-		log.Println("failed to pass sqlparser")
 		log.Fatalln(err)
 	}
 
@@ -104,7 +103,7 @@ func main() {
 			tblName := firstTable.Expr.(sqlparser.TableName).Name.String()
 			tbl, err := db.GetTable(tblName)
 			if err != nil {
-				log.Fatalln(err)
+				log.Fatalln(err, "table error")
 			}
 
 			cols := []string{}
