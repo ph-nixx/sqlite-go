@@ -39,15 +39,16 @@ type Cell struct {
 type Condition func(*Cell) (bool, error)
 
 func (c *Cell) UnwrapAsStrings(colOrder ...string) ([]string, error) {
-	if len(colOrder) != len(c.fields) {
-		return nil, fmt.Errorf(
-			"'%d' columns provided expected '%d'",
-			len(colOrder),
-			len(c.fields),
-		)
-	}
+	// if len(colOrder) != len(c.fields) {
+	// 	return nil, fmt.Errorf(
+	// 		"'%d' columns provided expected '%d'",
+	// 		len(colOrder),
+	// 		len(c.fields),
+	// 	)
+	// }
+	//
 
-	fieldValues := make([]string, len(c.fields))
+	fieldValues := make([]string, len(colOrder))
 	for i, col := range colOrder {
 		str, err := c.UnwrapAsString(col)
 		if err != nil {
