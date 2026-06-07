@@ -222,17 +222,17 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 // The indices of mask map 1:1 with [Table.ColOrder] and can vary in size,
 // this means we don't need to iterate over every field just to collect a subset.
 func (t *Table) getLeafCellFields(cellPtr int, mask []bool) (*Cell, error) {
-	_, cellSizeByteCount, err := decodeVarintAt(t.fd, cellPtr)
+	_, cellSizeLen, err := decodeVarintAt(t.fd, cellPtr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode recordSize varint: %w", err)
 	}
 
-	_, rowIDByteCount, err := decodeVarintAt(t.fd, cellPtr+cellSizeByteCount)
+	_, rowIdLen, err := decodeVarintAt(t.fd, cellPtr+cellSizeLen)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode rowid varint: %w", err)
 	}
 
-	headerPtr := cellPtr + cellSizeByteCount + rowIDByteCount
+	headerPtr := cellPtr + cellSizeLen + rowIdLen
 	headerSize, headerSizeByteCount, err := decodeVarintAt(t.fd, headerPtr)
 	if err != nil {
 		return nil, fmt.Errorf("failed to decode record header size varint: %w", err)
@@ -262,8 +262,9 @@ func (t *Table) getLeafCellFields(cellPtr int, mask []bool) (*Cell, error) {
 
 			// assuming the first field is always the PK if it is null, then sqlite stores the value in the header
 			if i == 0 && serialType == 0 {
-				rowIDPtr := cellPtr + cellSizeByteCount
-				field.ptr = rowIDPtr
+				rowIdPtr := cellPtr + cellSizeLen
+				field.ptr = rowIdPtr
+				field.length = rowIdLen
 			}
 			fields[t.ColOrder[i]] = field
 		}

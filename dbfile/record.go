@@ -20,15 +20,21 @@ type RecordField struct {
 }
 
 func (r *RecordField) parseToString(fd io.ReaderAt) (string, error) {
-	if r.serialType == 0 {
+	if r.serialType == 0 && r.length == 0 {
 		return "null", nil
+	}
+	if r.serialType == 0 && r.length > 0 {
+		num, _, err := decodeVarintAt(fd, r.ptr)
+		if err != nil {
+			return "", fmt.Errorf("failed to decode rowid varint: %w", err)
+		}
+		return strconv.FormatInt(int64(num), 10), nil
 	}
 
 	buf := make([]byte, r.length)
 	if _, err := fd.ReadAt(buf, int64(r.ptr)); err != nil {
 		return "", err
 	}
-
 	if r.serialType >= 13 && r.serialType%2 == 1 {
 		return string(buf), nil
 	}
