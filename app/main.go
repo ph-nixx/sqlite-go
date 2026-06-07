@@ -132,6 +132,7 @@ func main() {
 						return fieldValue == val, nil
 					}
 				}
+				cols = append(cols, col)
 			}
 
 			cells, err := tbl.GetCells(fn, cols...)
