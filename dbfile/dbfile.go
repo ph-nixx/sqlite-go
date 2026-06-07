@@ -121,5 +121,7 @@ func (d *DBFile) GetTable(tblName string) (*Table, error) {
 }
 
 func normalizeSql(sql string) string {
-	return strings.ReplaceAll(sql, " autoincrement", "")
+	sql = strings.ReplaceAll(sql, " autoincrement", "")
+	sql = strings.ReplaceAll(sql, `"`, "`")
+	return sql
 }

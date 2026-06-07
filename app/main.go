@@ -103,7 +103,7 @@ func main() {
 			tblName := firstTable.Expr.(sqlparser.TableName).Name.String()
 			tbl, err := db.GetTable(tblName)
 			if err != nil {
-				log.Fatalln(err, "table error")
+				log.Fatalln(err)
 			}
 
 			cols := []string{}
