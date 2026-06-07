@@ -78,22 +78,29 @@ func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 		fn = func(c *Cell) (bool, error) { return true, nil }
 	}
 
+	seen := map[string]bool{}
+	uniqueCols := make([]string, 0, len(cols))
+	for _, col := range cols {
+		if !seen[col] {
+			uniqueCols = append(uniqueCols, col)
+			seen[col] = true
+		}
+	}
+	slices.Sort(uniqueCols)
 	colOrderMask := make([]bool, len(t.ColOrder))
 	foundColsMask := make([]bool, len(cols))
-	colsClone := slices.Clone(cols)
-	slices.Sort(colsClone)
 	greatestIdx := 0
-	missing := len(colsClone)
+	missing := len(uniqueCols)
 	for i, p := range t.ColOrder {
 		if missing == 0 {
 			break
 		}
-		lo, up := 0, len(colsClone)-1
+		lo, up := 0, len(uniqueCols)-1
 		for lo <= up {
 			mid := (lo + up) / 2
-			if colsClone[mid] < p {
+			if uniqueCols[mid] < p {
 				lo = mid + 1
-			} else if colsClone[mid] > p {
+			} else if uniqueCols[mid] > p {
 				up = mid - 1
 			} else {
 				colOrderMask[i] = true
@@ -109,7 +116,7 @@ func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 		unknownCols := []string{}
 		for i, found := range foundColsMask {
 			if !found {
-				unknownCols = append(unknownCols, colsClone[i])
+				unknownCols = append(unknownCols, uniqueCols[i])
 			}
 		}
 		return nil, fmt.Errorf("undefined cols [%s]", strings.Join(unknownCols, ", "))
@@ -185,9 +192,9 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 	if _, err := t.fd.ReadAt(buf, int64(rightMostPtr)); err != nil {
 		return nil, err
 	}
+
 	childPageNumber := int(binary.BigEndian.Uint32(buf))
 	cellPtrs = append(cellPtrs, childPageNumber)
-
 	for _, ptr := range cellPtrs {
 		buf := make([]byte, interiorCellChildPageNumberLen)
 		if _, err := t.fd.ReadAt(buf, int64(ptr)); err != nil {
@@ -195,6 +202,7 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 		}
 
 		childPageNumber := int(binary.BigEndian.Uint32(buf))
+		fmt.Println(childPageNumber)
 		cells, err := t.getLeafCells(childPageNumber, mask, fn)
 		if err != nil {
 			return nil, err

@@ -116,6 +116,7 @@ func main() {
 				}
 			}
 
+			conditionCol := []string{}
 			var fn dbfile.Condition = nil
 			if stmt.Where != nil {
 				comp, _ := stmt.Where.Expr.(*sqlparser.ComparisonExpr)
@@ -132,10 +133,10 @@ func main() {
 						return fieldValue == val, nil
 					}
 				}
-				cols = append(cols, col)
+				conditionCol = append(conditionCol, col)
 			}
 
-			cells, err := tbl.GetCells(fn, cols...)
+			cells, err := tbl.GetCells(fn, append(cols, conditionCol...)...)
 			if err != nil {
 				log.Fatalln(err)
 			}
