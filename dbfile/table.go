@@ -172,42 +172,47 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 	}
 
 	result := []*Cell{}
-	if pageType == leafPageType || pageNumber == sqliteSchemaPageNumber {
+	if pageType == interiorPageType {
 		for _, ptr := range cellPtrs {
-			cell, err := t.getLeafCellFields(ptr, mask)
+			buf := make([]byte, interiorCellChildPageNumberLen)
+			if _, err := t.fd.ReadAt(buf, int64(ptr)); err != nil {
+				return nil, err
+			}
+
+			childPageNumber := int(binary.BigEndian.Uint32(buf))
+			fmt.Println(childPageNumber, len(result))
+			cells, err := t.getLeafCells(childPageNumber, mask, fn)
 			if err != nil {
 				return nil, err
 			}
-			if ok, err := fn(cell); err != nil {
-				return nil, err
-			} else if ok {
-				result = append(result, cell)
-			}
+			result = append(result, cells...)
 		}
-		return result, nil
-	}
 
-	buf = make([]byte, interiorCellChildPageNumberLen)
-	rightMostPtr := pagePtr + interiorPageRightMostPtr
-	if _, err := t.fd.ReadAt(buf, int64(rightMostPtr)); err != nil {
-		return nil, err
-	}
-
-	childPageNumber := int(binary.BigEndian.Uint32(buf))
-	cellPtrs = append(cellPtrs, childPageNumber)
-	for _, ptr := range cellPtrs {
-		buf := make([]byte, interiorCellChildPageNumberLen)
-		if _, err := t.fd.ReadAt(buf, int64(ptr)); err != nil {
+		buf = make([]byte, interiorCellChildPageNumberLen)
+		rightMostPtr := pagePtr + interiorPageRightMostPtr
+		if _, err := t.fd.ReadAt(buf, int64(rightMostPtr)); err != nil {
 			return nil, err
 		}
 
 		childPageNumber := int(binary.BigEndian.Uint32(buf))
-		fmt.Println(childPageNumber, len(result))
 		cells, err := t.getLeafCells(childPageNumber, mask, fn)
 		if err != nil {
 			return nil, err
 		}
 		result = append(result, cells...)
+		return result, nil
+	}
+
+	for _, ptr := range cellPtrs {
+		cell, err := t.getLeafCellFields(ptr, mask)
+		if err != nil {
+			return nil, err
+		}
+		if ok, err := fn(cell); err != nil {
+			return nil, err
+		} else if ok {
+			result = append(result, cell)
+		}
 	}
 	return result, nil
 }
