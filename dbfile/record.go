@@ -9,18 +9,13 @@ import (
 )
 
 const (
-	databaseFilePageSizeOffset       = 16
-	cellPtrArraySizeOffsetFromHeader = 3
-	cellPtrArrayOffsetFromLeafHeader = 8
-	cellPtrVarint                    = 2
-	pageSizeVarint                   = 2
-	pageCellCountVarint              = 2
-	varintMax                        = 9
+	databaseFilePageSizePtr = 16
+	varintMax               = 9
 )
 
 type RecordField struct {
 	serialType int
-	offset     int
+	ptr        int
 	length     int
 }
 
@@ -30,7 +25,7 @@ func (r *RecordField) parseToString(fd io.ReaderAt) (string, error) {
 	}
 
 	buf := make([]byte, r.length)
-	if _, err := fd.ReadAt(buf, int64(r.offset)); err != nil {
+	if _, err := fd.ReadAt(buf, int64(r.ptr)); err != nil {
 		return "", err
 	}
 
@@ -77,9 +72,9 @@ func decodeSerialTypePayloadLen(serialType int) int {
 	}
 }
 
-func decodeVarintAt(dbfile io.ReaderAt, offset int) (uint64, int, error) {
+func decodeVarintAt(dbfile io.ReaderAt, ptr int) (uint64, int, error) {
 	buf := make([]byte, varintMax)
-	if _, err := dbfile.ReadAt(buf, int64(offset)); err != nil {
+	if _, err := dbfile.ReadAt(buf, int64(ptr)); err != nil {
 		return 0, 0, err
 	}
 	var number uint64

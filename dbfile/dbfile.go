@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	sqliteSchemaPageOffset   = 0
-	sqliteSchemaHeaderOffset = 100
+	sqliteSchemaPageNumber = 1
+	pageSizeLen            = 2
 )
 
 var sqliteSchemaColOrder = []string{"tableType", "name", "tblName", "rootpage", "sql"}
@@ -30,15 +30,16 @@ type DBFile struct {
 }
 
 func New(fd io.ReaderAt) (*DBFile, error) {
-	buf := make([]byte, pageSizeVarint)
-	if _, err := fd.ReadAt(buf, databaseFilePageSizeOffset); err != nil {
+	buf := make([]byte, pageSizeLen)
+	if _, err := fd.ReadAt(buf, databaseFilePageSizePtr); err != nil {
 		return nil, err
 	}
 	pageSize := int(binary.BigEndian.Uint16(buf))
 	sqliteSchema := Table{
-		fd:         fd,
-		ColOrder:   sqliteSchemaColOrder,
-		pageOffset: sqliteSchemaPageOffset,
+		fd:       fd,
+		ColOrder: sqliteSchemaColOrder,
+		rootpage: sqliteSchemaPageNumber,
+		pageSize: pageSize,
 	}
 	return &DBFile{fd: fd, sqliteSchema: sqliteSchema, PageSize: pageSize}, nil
 }
@@ -50,7 +51,7 @@ func (d *DBFile) GetTableNames() ([]string, error) {
 	}
 	result := []string{}
 	for _, cell := range cells {
-		fieldValues, err := cell.UnwrapAsStrings()
+		fieldValues, err := cell.UnwrapAsStrings(sqliteSchemaColOrder[2])
 		if err != nil {
 			return nil, err
 		}
@@ -111,11 +112,11 @@ func (d *DBFile) GetTable(tblName string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	pageOffset := (rootpageInt - 1) * d.PageSize
 	return &Table{
-		fd:         d.fd,
-		ColOrder:   colNames,
-		pageOffset: pageOffset,
+		fd:       d.fd,
+		ColOrder: colNames,
+		rootpage: rootpageInt,
+		pageSize: d.PageSize,
 	}, nil
 }
 
