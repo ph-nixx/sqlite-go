@@ -202,7 +202,7 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 		}
 
 		childPageNumber := int(binary.BigEndian.Uint32(buf))
-		fmt.Println(childPageNumber)
+		fmt.Println(childPageNumber, len(result))
 		cells, err := t.getLeafCells(childPageNumber, mask, fn)
 		if err != nil {
 			return nil, err
