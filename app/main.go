@@ -79,6 +79,7 @@ func main() {
 
 	stmt, err := sqlparser.Parse(command)
 	if err != nil {
+		log.Println("failed to pass sqlparser")
 		log.Fatalln(err)
 	}
 
