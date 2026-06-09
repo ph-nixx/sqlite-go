@@ -150,8 +150,6 @@ func (d *DBFile) GetTable(tblName string) (*Table, error) {
 		if err != nil {
 			return nil, err
 		}
-
-		fmt.Println(sql)
 		strt := strings.Index(sql, "(")
 		end := strings.Index(sql, ")")
 		parts := strings.Split(sql[strt+1:end], ", ")
