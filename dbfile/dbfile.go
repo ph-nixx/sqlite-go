@@ -66,16 +66,22 @@ func (d *DBFile) GetTableNames() ([]string, error) {
 func (d *DBFile) GetTable(tblName string) (*Table, error) {
 	con := &Condition{
 		Eq: func(cell *Cell) (bool, error) {
-			str, err := cell.UnwrapAsString(sqliteSchemaColOrder[2])
+			name, err := cell.UnwrapAsString(sqliteSchemaColOrder[2])
 			if err != nil {
 				return false, err
 			}
-			return str == tblName, nil
+
+			type_, err := cell.UnwrapAsString(sqliteSchemaColOrder[0])
+			if err != nil {
+				return false, err
+			}
+			return name == tblName && type_ == "table", nil
 		},
 		Cols: sqliteSchemaColOrder[2:3],
 	}
 	cells, err := d.sqliteSchema.GetLeafCells(
 		con,
+		sqliteSchemaColOrder[0],
 		sqliteSchemaColOrder[2],
 		sqliteSchemaColOrder[3],
 		sqliteSchemaColOrder[4],
