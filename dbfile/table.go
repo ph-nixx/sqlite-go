@@ -5,80 +5,61 @@ import (
 	"fmt"
 	"io"
 	"slices"
+	"strconv"
 	"strings"
 )
 
 const (
-	interiorPageType               = 0x05
-	leafPageType                   = 0x0d
-	pageTypeLen                    = 1
-	pageCellPtrArrayCellCount      = 3
-	leafPageCellPtrArray           = 8
-	interiorPageCellPtrArray       = 12
-	interiorPageRightMostPtr       = 8
-	cellPtrLen                     = 2
-	pageCellCountLen               = 2
-	interiorCellChildPageNumberLen = 4
-	sqliteSchemaHeaderPtr          = 100
+	interiorPageType             = 0x05
+	leafPageType                 = 0x0d
+	indexInteriorPageType        = 0x02
+	indexLeafPageType            = 0x0a
+	cellPtrAryCellCntStrt        = 3
+	cellPtrAryCellCntEnd         = cellPtrAryCellCntStrt + 2
+	leafPageCellPtrAryStrt       = 8
+	interiorPageCellPtrAryStrt   = 12
+	interiorPageRightMostPtrStrt = 8
+	interiorPageRightMostPtrEnd  = 12
+	cellPtrLen                   = 2
+	pageNumLen                   = 4
+	sqliteSchemaHeaderOfs        = 100
+	pageTypeOfs                  = 0
+	rowIdLen                     = 2
+	indexRowIdField              = "rowid"
 )
 
+// indices only support single column indices, hence the 'string' key type for the map.
 type Table struct {
 	fd       io.ReaderAt
 	ColOrder []string
 	rootpage int
 	pageSize int
+	indices  map[string]*index
 }
 
-// The on disk representation of a sqlite row: a set of fields with the meta data to collection them.
-// Table leaf cell.
-type Cell struct {
-	fd     io.ReaderAt
-	fields map[string]*RecordField
+type index struct {
+	pageNum  int
+	colOrder []string
 }
 
-type Condition func(*Cell) (bool, error)
-
-func (c *Cell) UnwrapAsStrings(colOrder ...string) ([]string, error) {
-	// if len(colOrder) != len(c.fields) {
-	// 	return nil, fmt.Errorf(
-	// 		"'%d' columns provided expected '%d'",
-	// 		len(colOrder),
-	// 		len(c.fields),
-	// 	)
-	// }
-	//
-
-	fieldValues := make([]string, len(colOrder))
-	for i, col := range colOrder {
-		str, err := c.UnwrapAsString(col)
-		if err != nil {
-			return nil, err
-		}
-		fieldValues[i] = str
-	}
-	return fieldValues, nil
+type Condition struct {
+	Cols []string
+	Eq   func(*Cell) (bool, error)
+	Gt   func(*Cell) (bool, error)
 }
 
-func (c *Cell) UnwrapAsString(fieldName string) (string, error) {
-	v, ok := c.fields[fieldName]
-	if !ok {
-		return "", fmt.Errorf("field '%s' does not exist", fieldName)
-	}
-	fieldValue, err := v.parseToString(c.fd)
-	if err != nil {
-		return "", err
-	}
-	return fieldValue, nil
+type split struct {
+	rowIds  []int
+	pageNum int
 }
 
 // Evaluates and returns only the desired fields of each qualified cell associated with a table leaf page.
 //
 // Refactor will unable collection from all table leaf pages of a table b-tree by recursively traversing from the root page.
-func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
-	if fn == nil {
-		fn = func(c *Cell) (bool, error) { return true, nil }
+func (t *Table) GetLeafCells(con *Condition, cols ...string) ([]*Cell, error) {
+	if con != nil {
+		cols = append(cols, con.Cols...)
 	}
-
 	seen := map[string]bool{}
 	uniqueCols := make([]string, 0, len(cols))
 	for _, col := range cols {
@@ -87,6 +68,7 @@ func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 			seen[col] = true
 		}
 	}
+
 	slices.Sort(uniqueCols)
 	colOrderMask := make([]bool, len(t.ColOrder))
 	foundColsMask := make([]bool, len(cols))
@@ -123,79 +105,190 @@ func (t *Table) GetCells(fn Condition, cols ...string) ([]*Cell, error) {
 		return nil, fmt.Errorf("undefined cols [%s]", strings.Join(unknownCols, ", "))
 	}
 
-	leafCells, err := t.getLeafCells(t.rootpage, colOrderMask[:greatestIdx+1], fn)
+	var rowIds []int
+	if con != nil && len(t.indices) > 0 {
+		for _, c := range con.Cols {
+			index, ok := t.indices[c]
+			if ok {
+				r, err := t.checkIndex(index.pageNum, index.colOrder, con)
+				if err != nil {
+					return nil, err
+				}
+				rowIds = r
+				break
+			}
+		}
+	}
+	if con == nil {
+		con = &Condition{Cols: nil, Eq: func(c *Cell) (bool, error) { return true, nil }}
+	}
+
+	leafCells, err := t.getLeafCells(t.rootpage, colOrderMask[:greatestIdx+1], con, rowIds)
 	if err != nil {
 		return nil, err
 	}
 	return leafCells, nil
 }
 
-func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell, error) {
-	pagePtr := (pageNumber - 1) * t.pageSize
-	buf := make([]byte, pageTypeLen)
-	if _, err := t.fd.ReadAt(buf, int64(pagePtr)); err != nil {
+// Uses a set of unique cols from a WHERE clause to traverse a index b-tree and collect the rowIds at each cell.
+func (t *Table) checkIndex(
+	pageNum int,
+	colOrder []string,
+	con *Condition,
+) ([]int, error) {
+	pagePtr := (pageNum - 1) * t.pageSize
+	page := make([]byte, t.pageSize)
+	if _, err := t.fd.ReadAt(page, int64(pagePtr)); err != nil {
 		return nil, err
 	}
 
-	pageType := buf[0]
-	var cellPtrArrayPtr int
-	var cellPtrArrayCellCountPtr int
-	if pageNumber == sqliteSchemaPageNumber {
-		cellPtrArrayPtr = sqliteSchemaHeaderPtr + leafPageCellPtrArray
-		cellPtrArrayCellCountPtr = sqliteSchemaHeaderPtr + pageCellPtrArrayCellCount
-	} else if pageType == interiorPageType {
-		cellPtrArrayPtr = pagePtr + interiorPageCellPtrArray
-		cellPtrArrayCellCountPtr = pagePtr + pageCellPtrArrayCellCount
-	} else if pageType == leafPageType {
-		cellPtrArrayPtr = pagePtr + leafPageCellPtrArray
-		cellPtrArrayCellCountPtr = pagePtr + pageCellPtrArrayCellCount
-	} else {
-		return nil, fmt.Errorf("undefined page type [%v]", buf[0])
+	pageType := page[pageTypeOfs]
+	var cellPtrBuf []byte
+	var cellCount int
+	switch pageType {
+	case indexInteriorPageType:
+		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
+		cellCount = int(binary.BigEndian.Uint16(buf))
+		cellPtrBuf = page[interiorPageCellPtrAryStrt : interiorPageCellPtrAryStrt+cellCount*cellPtrLen]
+	case indexLeafPageType:
+		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
+		cellCount = int(binary.BigEndian.Uint16(buf))
+		cellPtrBuf = page[leafPageCellPtrAryStrt : leafPageCellPtrAryStrt+cellCount*cellPtrLen]
+	default:
+		return nil, fmt.Errorf("page type '%v' is undefined", pageType)
 	}
 
-	buf = make([]byte, pageCellCountLen)
-	if _, err := t.fd.ReadAt(buf, int64(cellPtrArrayCellCountPtr)); err != nil {
-		return nil, fmt.Errorf("failed to read table page header [%w]", err)
-	}
-
-	cellCount := int(binary.BigEndian.Uint16(buf))
-	buf = make([]byte, cellCount*cellPtrLen)
-	_, err := t.fd.ReadAt(buf, int64(cellPtrArrayPtr))
-	if err != nil {
-		return nil, fmt.Errorf("failed to read table page header: [%w]", err)
-	}
-
-	cellPtrs := make([]int, cellCount)
-	for i := range cellCount {
-		start := i * cellPtrLen
-		end := (i + 1) * cellPtrLen
-		cellPtrs[i] = int(binary.BigEndian.Uint16(buf[start:end])) + pagePtr
-	}
-
-	result := []*Cell{}
-	if pageType == interiorPageType {
-		for _, ptr := range cellPtrs {
-			buf := make([]byte, interiorCellChildPageNumberLen)
-			if _, err := t.fd.ReadAt(buf, int64(ptr)); err != nil {
+	var result []int
+	if pageType == indexInteriorPageType {
+		skipRightMostChild := false
+		for i := range cellCount {
+			start := i * cellPtrLen
+			end := (i + 1) * cellPtrLen
+			cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
+			cell, err := getCellPayload(page[cellPtr+pageNumLen:], colOrder, nil)
+			if err != nil {
 				return nil, err
 			}
 
-			childPageNumber := int(binary.BigEndian.Uint32(buf))
-			cells, err := t.getLeafCells(childPageNumber, mask, fn)
+			gt, err := con.Gt(cell)
+			if err != nil {
+				return nil, err
+			}
+			eq, err := con.Eq(cell)
+			if err != nil {
+				return nil, err
+			}
+
+			if eq {
+				rowId, err := cell.UnwrapAsString(indexRowIdField)
+				if err != nil {
+					return nil, err
+				}
+				num, err := strconv.Atoi(rowId)
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, int(num))
+			}
+			if gt || eq {
+				leftChildPageNum := int(binary.BigEndian.Uint32(page[cellPtr : cellPtr+pageNumLen]))
+				rowIds, err := t.checkIndex(leftChildPageNum, colOrder, con)
+				if err != nil {
+					return nil, err
+				}
+				result = append(result, rowIds...)
+				skipRightMostChild = true
+				break
+			}
+		}
+		if !skipRightMostChild {
+			childPagebuf := page[interiorPageRightMostPtrStrt:interiorPageRightMostPtrEnd]
+			childPageNum := int(binary.BigEndian.Uint32(childPagebuf))
+			rowIds, err := t.checkIndex(childPageNum, colOrder, con)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, rowIds...)
+		}
+		return result, nil
+	}
+
+	// index leaf cell
+	for i := range cellCount {
+		start := i * cellPtrLen
+		end := (i + 1) * cellPtrLen
+		cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
+		cell, err := getCellPayload(page[cellPtr:], colOrder, nil)
+		if err != nil {
+			return nil, err
+		}
+		if ok, err := con.Eq(cell); err != nil {
+			return nil, err
+		} else if ok {
+			rowId, err := cell.UnwrapAsString(indexRowIdField)
+			if err != nil {
+				return nil, err
+			}
+			num, err := strconv.Atoi(rowId)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, int(num))
+		}
+	}
+	return result, nil
+}
+
+func (t *Table) getLeafCells(pageNum int, mask []bool, con *Condition, rowIds []int) ([]*Cell, error) {
+	pagePtr := (pageNum - 1) * t.pageSize
+	page := make([]byte, t.pageSize)
+	if _, err := t.fd.ReadAt(page, int64(pagePtr)); err != nil {
+		return nil, err
+	}
+
+	pageType := page[pageTypeOfs]
+	var cellPtrBuf []byte
+	var cellCount int
+	if pageType == interiorPageType {
+		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
+		cellCount = int(binary.BigEndian.Uint16(buf))
+		cellPtrBuf = page[interiorPageCellPtrAryStrt : interiorPageCellPtrAryStrt+cellCount*cellPtrLen]
+	} else if pageType == leafPageType {
+		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
+		cellCount = int(binary.BigEndian.Uint16(buf))
+		cellPtrBuf = page[leafPageCellPtrAryStrt : leafPageCellPtrAryStrt+cellCount*cellPtrLen]
+	} else if pageNum == sqliteSchemaPageNum {
+		strt := sqliteSchemaHeaderOfs + cellPtrAryCellCntStrt
+		end := sqliteSchemaHeaderOfs + cellPtrAryCellCntEnd
+		cellCount = int(binary.BigEndian.Uint16(page[strt:end]))
+		strt = sqliteSchemaHeaderOfs + leafPageCellPtrAryStrt
+		end = sqliteSchemaHeaderOfs + leafPageCellPtrAryStrt + cellCount*cellPtrLen
+		cellPtrBuf = page[strt:end]
+	} else {
+		return nil, fmt.Errorf("page type '%v' is undefined", pageType)
+	}
+
+	result := []*Cell{}
+	if pageType == interiorPageType && rowIds == nil {
+		for i := range cellCount {
+			start := i * cellPtrLen
+			end := (i + 1) * cellPtrLen
+			cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
+			rowIdStrt := cellPtr + pageNumLen
+			buf := page[cellPtr:rowIdStrt]
+			pageNum := int(
+				binary.BigEndian.Uint32(buf),
+			)
+			cells, err := t.getLeafCells(pageNum, mask, con, rowIds)
 			if err != nil {
 				return nil, err
 			}
 			result = append(result, cells...)
 		}
 
-		buf = make([]byte, interiorCellChildPageNumberLen)
-		rightMostPtr := pagePtr + interiorPageRightMostPtr
-		if _, err := t.fd.ReadAt(buf, int64(rightMostPtr)); err != nil {
-			return nil, err
-		}
-
-		childPageNumber := int(binary.BigEndian.Uint32(buf))
-		cells, err := t.getLeafCells(childPageNumber, mask, fn)
+		buf := page[interiorPageRightMostPtrStrt:interiorPageRightMostPtrEnd]
+		pageNum := int(binary.BigEndian.Uint32(buf))
+		cells, err := t.getLeafCells(pageNum, mask, con, rowIds)
 		if err != nil {
 			return nil, err
 		}
@@ -203,12 +296,33 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 		return result, nil
 	}
 
-	for _, ptr := range cellPtrs {
-		cell, err := t.getLeafCellFields(ptr, mask)
+	// assuming this mechanism will only traverse to a sequence of leaf cells that contains the desired field value
+	if pageType == interiorPageType && rowIds != nil {
+		buf := page[interiorPageRightMostPtrStrt:interiorPageRightMostPtrEnd]
+		pageNum := int(binary.BigEndian.Uint32(buf))
+		splits, err := getRowIdSplits(rowIds, cellPtrBuf, pageNum, page)
 		if err != nil {
 			return nil, err
 		}
-		if ok, err := fn(cell); err != nil {
+		for _, s := range splits {
+			cells, err := t.getLeafCells(s.pageNum, mask, con, s.rowIds)
+			if err != nil {
+				return nil, err
+			}
+			result = append(result, cells...)
+		}
+		return result, nil
+	}
+
+	for i := range cellCount {
+		start := i * cellPtrLen
+		end := (i + 1) * cellPtrLen
+		cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
+		cell, err := getCellPayload(page[cellPtr:], t.ColOrder, mask)
+		if err != nil {
+			return nil, err
+		}
+		if ok, err := con.Eq(cell); err != nil {
 			return nil, err
 		} else if ok {
 			result = append(result, cell)
@@ -217,60 +331,72 @@ func (t *Table) getLeafCells(pageNumber int, mask []bool, fn Condition) ([]*Cell
 	return result, nil
 }
 
+// Assuming [rowIds] are sorted in accending order this function will group each sub sequences of row IDs
+// with the page number that has a key which is greater than or equal to the last row ID in the sequence.
+func getRowIdSplits(rowIds []int, cellPtrBuf []byte, rightMostPageNum int, page []byte) ([]split, error) {
+	if len(cellPtrBuf) == 0 || len(cellPtrBuf)%cellPtrLen != 0 {
+		return nil, fmt.Errorf("a cell pointer array must be a multiple of '%d' bytes", cellPtrLen)
+	}
+
+	cellCount := len(cellPtrBuf) / cellPtrLen
+	result := make([]split, 0, cellCount+1)
+	splitInx := 0
+	for i := 0; i < cellCount && splitInx < len(rowIds); i += 1 {
+		cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[cellPtrLen*i : cellPtrLen*(i+1)]))
+		pageNum := int(binary.BigEndian.Uint16(page[cellPtr : cellPtr+pageNumLen]))
+		key, _ := decodeVarint(page[cellPtr+pageNumLen:])
+
+		j := splitInx
+		for j < len(rowIds) && rowIds[j] <= key {
+			j += 1
+		}
+		if j > splitInx {
+			result = append(result, split{rowIds[splitInx:j], pageNum})
+		}
+	}
+	if splitInx < len(rowIds) {
+		result = append(result, split{rowIds[splitInx:], rightMostPageNum})
+	}
+
+	return result, nil
+}
+
 // Collects a table leaf page cell with a sub set fields choosen from [Table.ColOrder].
 //
 // The indices of mask map 1:1 with [Table.ColOrder] and can vary in size,
 // this means we don't need to iterate over every field just to collect a subset.
-func (t *Table) getLeafCellFields(cellPtr int, mask []bool) (*Cell, error) {
-	_, cellSizeLen, err := decodeVarintAt(t.fd, cellPtr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode recordSize varint: %w", err)
-	}
+func getCellPayload(cellBuf []byte, colOrder []string, mask []bool) (*Cell, error) {
+	_, cellSizeLen := decodeVarint(cellBuf)
+	_, rowIdLen := decodeVarint(cellBuf[cellSizeLen:])
+	headerOfs := cellSizeLen + rowIdLen
+	headerSize, headerSizeByteCount := decodeVarint(cellBuf[headerOfs:])
 
-	_, rowIdLen, err := decodeVarintAt(t.fd, cellPtr+cellSizeLen)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode rowid varint: %w", err)
-	}
-
-	headerPtr := cellPtr + cellSizeLen + rowIdLen
-	headerSize, headerSizeByteCount, err := decodeVarintAt(t.fd, headerPtr)
-	if err != nil {
-		return nil, fmt.Errorf("failed to decode record header size varint: %w", err)
-	}
-
-	serialTypePtr := headerPtr + headerSizeByteCount
-	fieldValuePtr := headerPtr + int(headerSize)
+	serialTypeOfs := headerOfs + headerSizeByteCount
+	fieldValueOfs := headerOfs + headerSize
 	fields := map[string]*RecordField{}
 
 	// this is information leakage; parsing the record format the responsibility of dbfile/record.go
 	// dbfile/table.go only needs to know about cell field values not how to get them.
-	for i, keep := range mask {
+	for i := 0; (mask != nil && i < len(mask)) || (mask == nil && i < len(colOrder)); i++ {
 
 		// if you simplified the RecordField interface this could all be abstracted away
-		serialType, serialTypeByteCount, err := decodeVarintAt(t.fd, serialTypePtr) // value is to vague and this interface is ambiguouse
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse record field: %w", err)
-		}
-
+		serialType, serialTypeByteCount := decodeVarint(cellBuf[serialTypeOfs:]) // value is to vague and this interface is ambiguouse
 		payloadLen := decodeSerialTypePayloadLen(int(serialType))
-		if keep {
+		if (mask != nil && mask[i]) || mask == nil {
 			field := &RecordField{
 				serialType: int(serialType),
-				ptr:        fieldValuePtr,
-				length:     payloadLen,
+				buf:        cellBuf[fieldValueOfs : fieldValueOfs+payloadLen],
 			}
 
 			// assuming the first field is always the PK if it is null, then sqlite stores the value in the header
 			if i == 0 && serialType == 0 {
-				rowIdPtr := cellPtr + cellSizeLen
-				field.ptr = rowIdPtr
-				field.length = rowIdLen
+				field.buf = cellBuf[cellSizeLen : cellSizeLen+rowIdLen]
 			}
-			fields[t.ColOrder[i]] = field
+			fields[colOrder[i]] = field
 		}
 
-		fieldValuePtr += payloadLen
-		serialTypePtr += serialTypeByteCount
+		fieldValueOfs += payloadLen
+		serialTypeOfs += serialTypeByteCount
 	}
-	return &Cell{fd: t.fd, fields: fields}, nil
+	return &Cell{fields: fields}, nil
 }

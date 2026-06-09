@@ -10,8 +10,8 @@ import (
 )
 
 const (
-	sqliteSchemaPageNumber = 1
-	pageSizeLen            = 2
+	sqliteSchemaPageNum = 1
+	pageSizeLen         = 2
 )
 
 var sqliteSchemaColOrder = []string{"tableType", "name", "tblName", "rootpage", "sql"}
@@ -38,14 +38,14 @@ func New(fd io.ReaderAt) (*DBFile, error) {
 	sqliteSchema := Table{
 		fd:       fd,
 		ColOrder: sqliteSchemaColOrder,
-		rootpage: sqliteSchemaPageNumber,
+		rootpage: sqliteSchemaPageNum,
 		pageSize: pageSize,
 	}
 	return &DBFile{fd: fd, sqliteSchema: sqliteSchema, PageSize: pageSize}, nil
 }
 
 func (d *DBFile) GetTableNames() ([]string, error) {
-	cells, err := d.sqliteSchema.GetCells(nil, sqliteSchemaColOrder[2])
+	cells, err := d.sqliteSchema.GetLeafCells(nil, sqliteSchemaColOrder[2])
 	if err != nil {
 		return nil, err
 	}
@@ -64,15 +64,19 @@ func (d *DBFile) GetTableNames() ([]string, error) {
 }
 
 func (d *DBFile) GetTable(tblName string) (*Table, error) {
-	cells, err := d.sqliteSchema.GetCells(
-		func(cell *Cell) (bool, error) {
+	con := &Condition{
+		Eq: func(cell *Cell) (bool, error) {
 			str, err := cell.UnwrapAsString(sqliteSchemaColOrder[2])
 			if err != nil {
 				return false, err
 			}
 			return str == tblName, nil
 		},
-		sqliteSchemaColOrder[2], // must include all fields used in the condition
+		Cols: sqliteSchemaColOrder[2:3],
+	}
+	cells, err := d.sqliteSchema.GetLeafCells(
+		con,
+		sqliteSchemaColOrder[2],
 		sqliteSchemaColOrder[3],
 		sqliteSchemaColOrder[4],
 	)
@@ -112,12 +116,74 @@ func (d *DBFile) GetTable(tblName string) (*Table, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Table{
+
+	con = &Condition{
+		Eq: func(cell *Cell) (bool, error) {
+			name, err := cell.UnwrapAsString(sqliteSchemaColOrder[2])
+			if err != nil {
+				return false, err
+			}
+
+			type_, err := cell.UnwrapAsString(sqliteSchemaColOrder[0])
+			if err != nil {
+				return false, err
+			}
+			return name == tblName && type_ == "index", nil
+		},
+		Cols: []string{sqliteSchemaColOrder[0], sqliteSchemaColOrder[2]},
+	}
+
+	cells, err = d.sqliteSchema.GetLeafCells(con, sqliteSchemaColOrder[3:]...)
+	if err != nil {
+		return nil, err
+	}
+
+	indices := map[string]*index{}
+	for _, c := range cells {
+		sql, err := c.UnwrapAsString(sqliteSchemaColOrder[4])
+		if err != nil {
+			return nil, err
+		}
+		stmt, err := sqlparser.Parse(sql)
+		if err != nil {
+			panic(err)
+		}
+
+		ddl, ok := stmt.(*sqlparser.DDL)
+		if !ok {
+			panic("not a DDL")
+		}
+
+		if ddl.TableSpec == nil {
+			panic("no table spec")
+		}
+
+		for _, inx := range ddl.TableSpec.Indexes {
+			if len(inx.Columns) != 1 {
+				return nil, fmt.Errorf("[Table.indices] only supports single column indices")
+			}
+			col := inx.Columns[0].Column.String()
+			pageNum, err := c.UnwrapAsString(sqliteSchemaColOrder[3])
+			if err != nil {
+				return nil, err
+			}
+
+			num, err := strconv.Atoi(pageNum)
+			if err != nil {
+				return nil, err
+			}
+			indices[col] = &index{pageNum: num, colOrder: []string{col, indexRowIdField}}
+		}
+	}
+
+	tbl := &Table{
 		fd:       d.fd,
 		ColOrder: colNames,
 		rootpage: rootpageInt,
 		pageSize: d.PageSize,
-	}, nil
+		indices:  indices,
+	}
+	return tbl, nil
 }
 
 func normalizeSql(sql string) string {

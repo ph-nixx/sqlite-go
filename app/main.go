@@ -92,7 +92,7 @@ func main() {
 				log.Fatalln(err)
 			}
 
-			cells, err := tbl.GetCells(nil, "id")
+			cells, err := tbl.GetLeafCells(nil, "id")
 			if err != nil {
 				log.Fatalln(err)
 			}
@@ -116,8 +116,7 @@ func main() {
 				}
 			}
 
-			conditionCol := []string{}
-			var fn dbfile.Condition = nil
+			var con *dbfile.Condition
 			if stmt.Where != nil {
 				comp, _ := stmt.Where.Expr.(*sqlparser.ComparisonExpr)
 				col := comp.Left.(*sqlparser.ColName).Name.String()
@@ -125,18 +124,25 @@ func main() {
 
 				switch comp.Operator {
 				case "=":
-					fn = func(cell *dbfile.Cell) (bool, error) {
+					eq := func(cell *dbfile.Cell) (bool, error) {
 						fieldValue, err := cell.UnwrapAsString(col)
 						if err != nil {
 							return false, err
 						}
-						return fieldValue == val, nil
+						return val == fieldValue, nil
 					}
+					gt := func(cell *dbfile.Cell) (bool, error) {
+						fieldValue, err := cell.UnwrapAsString(col)
+						if err != nil {
+							return false, err
+						}
+						return val > fieldValue, nil
+					}
+					con = &dbfile.Condition{Eq: eq, Gt: gt, Cols: []string{col}}
 				}
-				conditionCol = append(conditionCol, col)
 			}
 
-			cells, err := tbl.GetCells(fn, append(cols, conditionCol...)...)
+			cells, err := tbl.GetLeafCells(con, cols...)
 			if err != nil {
 				log.Fatalln(err)
 			}
