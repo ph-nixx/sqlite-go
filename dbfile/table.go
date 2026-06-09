@@ -149,11 +149,15 @@ func (t *Table) checkIndex(
 	case indexInteriorPageType:
 		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
 		cellCount = int(binary.BigEndian.Uint16(buf))
-		cellPtrBuf = page[interiorPageCellPtrAryStrt : interiorPageCellPtrAryStrt+cellCount*cellPtrLen]
+		s := interiorPageCellPtrAryStrt
+		e := interiorPageCellPtrAryStrt + cellCount*cellPtrLen
+		cellPtrBuf = page[s:e]
 	case indexLeafPageType:
 		buf := page[cellPtrAryCellCntStrt:cellPtrAryCellCntEnd]
 		cellCount = int(binary.BigEndian.Uint16(buf))
-		cellPtrBuf = page[leafPageCellPtrAryStrt : leafPageCellPtrAryStrt+cellCount*cellPtrLen]
+		s := leafPageCellPtrAryStrt
+		e := leafPageCellPtrAryStrt + cellCount*cellPtrLen
+		cellPtrBuf = page[s:e]
 	default:
 		return nil, fmt.Errorf("page type '%v' is undefined", pageType)
 	}
@@ -162,10 +166,11 @@ func (t *Table) checkIndex(
 	if pageType == indexInteriorPageType {
 		skipRightMostChild := false
 		for i := range cellCount {
-			start := i * cellPtrLen
-			end := (i + 1) * cellPtrLen
-			cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
-			cell, err := getCellPayload(page[cellPtr+pageNumLen:], colOrder, nil)
+			s := i * cellPtrLen
+			e := (i + 1) * cellPtrLen
+			cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[s:e]))
+			s = cellPtr + pageNumLen
+			cell, err := getCellPayload(page[s:], colOrder, nil)
 			if err != nil {
 				return nil, err
 			}
@@ -191,7 +196,9 @@ func (t *Table) checkIndex(
 				result = append(result, int(num))
 			}
 			if gt || eq {
-				leftChildPageNum := int(binary.BigEndian.Uint32(page[cellPtr : cellPtr+pageNumLen]))
+				s := cellPtr
+				e := cellPtr + pageNumLen
+				leftChildPageNum := int(binary.BigEndian.Uint32(page[s:e]))
 				rowIds, err := t.checkIndex(leftChildPageNum, colOrder, con)
 				if err != nil {
 					return nil, err
@@ -202,8 +209,10 @@ func (t *Table) checkIndex(
 			}
 		}
 		if !skipRightMostChild {
-			childPagebuf := page[interiorPageRightMostPtrStrt:interiorPageRightMostPtrEnd]
-			childPageNum := int(binary.BigEndian.Uint32(childPagebuf))
+			s := interiorPageRightMostPtrStrt
+			e := interiorPageRightMostPtrEnd
+			buf := page[s:e]
+			childPageNum := int(binary.BigEndian.Uint32(buf))
 			rowIds, err := t.checkIndex(childPageNum, colOrder, con)
 			if err != nil {
 				return nil, err
@@ -215,10 +224,11 @@ func (t *Table) checkIndex(
 
 	// index leaf cell
 	for i := range cellCount {
-		start := i * cellPtrLen
-		end := (i + 1) * cellPtrLen
-		cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[start:end]))
-		cell, err := getCellPayload(page[cellPtr:], colOrder, nil)
+		s := i * cellPtrLen
+		e := (i + 1) * cellPtrLen
+		cellPtr := int(binary.BigEndian.Uint16(cellPtrBuf[s:e]))
+		s = cellPtr
+		cell, err := getCellPayload(page[s:], colOrder, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -367,10 +377,12 @@ func getRowIdSplits(rowIds []int, cellPtrBuf []byte, rightMostPageNum int, page 
 // this means we don't need to iterate over every field just to collect a subset.
 func getCellPayload(cellBuf []byte, colOrder []string, mask []bool) (*Cell, error) {
 	_, cellSizeLen := decodeVarint(cellBuf)
-	_, rowIdLen := decodeVarint(cellBuf[cellSizeLen:])
+	rowIdLen := 0
+	if mask != nil {
+		_, rowIdLen = decodeVarint(cellBuf[cellSizeLen:])
+	}
 	headerOfs := cellSizeLen + rowIdLen
 	headerSize, headerSizeByteCount := decodeVarint(cellBuf[headerOfs:])
-
 	serialTypeOfs := headerOfs + headerSizeByteCount
 	fieldValueOfs := headerOfs + headerSize
 	fields := map[string]*RecordField{}
