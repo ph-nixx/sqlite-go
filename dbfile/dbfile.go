@@ -150,36 +150,24 @@ func (d *DBFile) GetTable(tblName string) (*Table, error) {
 		if err != nil {
 			return nil, err
 		}
-		stmt, err := sqlparser.Parse(sql)
+
+		fmt.Println(sql)
+		strt := strings.Index(sql, "(")
+		end := strings.Index(sql, ")")
+		parts := strings.Split(sql[strt+1:end], ", ")
+		if len(parts) != 1 {
+			return nil, fmt.Errorf("[Table.indices] only supports single column indices")
+		}
+		pageNum, err := c.UnwrapAsString(sqliteSchemaColOrder[3])
 		if err != nil {
-			panic(err)
+			return nil, err
 		}
 
-		ddl, ok := stmt.(*sqlparser.DDL)
-		if !ok {
-			panic("not a DDL")
+		num, err := strconv.Atoi(pageNum)
+		if err != nil {
+			return nil, err
 		}
-
-		if ddl.TableSpec == nil {
-			panic("no table spec")
-		}
-
-		for _, inx := range ddl.TableSpec.Indexes {
-			if len(inx.Columns) != 1 {
-				return nil, fmt.Errorf("[Table.indices] only supports single column indices")
-			}
-			col := inx.Columns[0].Column.String()
-			pageNum, err := c.UnwrapAsString(sqliteSchemaColOrder[3])
-			if err != nil {
-				return nil, err
-			}
-
-			num, err := strconv.Atoi(pageNum)
-			if err != nil {
-				return nil, err
-			}
-			indices[col] = &index{pageNum: num, colOrder: []string{col, indexRowIdField}}
-		}
+		indices[parts[0]] = &index{pageNum: num, colOrder: []string{parts[0], indexRowIdField}}
 	}
 
 	tbl := &Table{
