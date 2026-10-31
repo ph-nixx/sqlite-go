@@ -33,7 +33,3 @@ download them by running this script:
 ```sh
 ./download_sample_databases.sh
 ```
-
-If the script doesn't work for some reason, you can download the databases
-directly from
-[codecrafters-io/sample-sqlite-databases](https://github.com/codecrafters-io/sample-sqlite-databases).
